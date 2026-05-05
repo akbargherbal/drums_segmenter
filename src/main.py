@@ -39,6 +39,12 @@ SUPPORTED_EXTENSIONS = {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac"}
 # htdemucs produces: vocals, drums, bass, other
 DEMUCS_STEMS = ["vocals", "drums", "bass", "other"]
 
+# ─────────────────────────── Sentinel for drum threshold ─────────────────────
+# FINDING-3: used to distinguish "user passed a custom value" from "user left
+# the default". When drum_silence_db == DEFAULT_DRUM_SILENCE_DB at runtime,
+# _compute_dynamic_silence_db() replaces it with a stem-relative value.
+DEFAULT_DRUM_SILENCE_DB: float = -40.0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  Device detection
@@ -105,7 +111,6 @@ def detect_vocal_windows(
     vocal_path: Path,
     vad_model,
     vad_utils,
-    silence_db: float,
     silence_duration: float,
     device: torch.device,
 ) -> list[tuple[float, float]]:
@@ -113,12 +118,22 @@ def detect_vocal_windows(
     Analyze the vocal stem and return a list of merged vocal windows:
         [(start_sec, end_sec), ...]
 
-    A window only closes when the vocal track stays below *silence_db* for
-    more than *silence_duration* consecutive seconds.  Any shorter gap —
-    breaths, ornamental pauses, maqam melisma — does NOT split the window.
+    A window only closes when the vocal track stays silent for more than
+    *silence_duration* consecutive seconds.  Any shorter gap — breaths,
+    ornamental pauses, maqam melisma — does NOT split the window.
 
     This makes the detector robust for Arabic music, which frequently contains
     long melismatic phrases separated by micro-pauses.
+
+    # FINDING-1: --vad-silence-db was removed (Path A).
+    # Silero VAD operates on a speech-probability score, not RMS energy.
+    # There is no meaningful way to wire a dBFS threshold directly into
+    # get_speech_timestamps() without an upstream RMS gate that would require
+    # resampling and frame alignment. The parameter was accepted but silently
+    # ignored in all prior versions. It has been removed from the CLI and this
+    # signature to avoid misleading users. If a pre-Silero energy gate is ever
+    # needed, implement _apply_energy_gate() upstream of this call and expose
+    # a new --vad-energy-gate flag at that time.
     """
     get_speech_timestamps, _, _, _, _ = vad_utils
 
@@ -184,6 +199,42 @@ def _compute_rms_db(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]
         np.arange(len(rms_db)), sr=sr, hop_length=hop_len
     )
     return times, rms_db
+
+
+def _compute_dynamic_silence_db(
+    audio: np.ndarray,
+    silence_db_override: float,
+) -> float:
+    """Return a stem-relative silence threshold for drum segmentation.
+
+    # FINDING-3: Demucs does not normalise its stem outputs. A track mastered
+    # at -15 dBFS produces a drum stem whose peaks sit near -15 dBFS, making
+    # the old fixed -40 dBFS cutoff slice straight through active drum content
+    # on quiet recordings — silently producing wrong or empty segments.
+    #
+    # Fix: compute the stem's actual peak level and place the threshold 35 dB
+    # below it (floored at -60 dBFS to avoid over-triggering on noise).
+    #
+    # Sentinel behaviour: when the caller passes DEFAULT_DRUM_SILENCE_DB
+    # (i.e. the user did not explicitly set --drum-silence-db), the dynamic
+    # value is used. When the user passes any other value, that value is
+    # used as-is so manual overrides are fully respected.
+
+    Args:
+        audio: mono float32 array of the drum stem (full file, not a window
+               slice) — peak estimate should reflect the whole stem's range.
+        silence_db_override: the value from --drum-silence-db.
+
+    Returns:
+        Effective silence threshold in dBFS.
+    """
+    if silence_db_override != DEFAULT_DRUM_SILENCE_DB:
+        # User explicitly overrode the default — respect their value exactly.
+        return silence_db_override
+
+    peak_db = 20.0 * np.log10(np.max(np.abs(audio)) + 1e-9)
+    dynamic = max(peak_db - 35.0, -60.0)
+    return dynamic
 
 
 def _split_on_silence(
@@ -262,6 +313,16 @@ def detect_drum_segments(
     audio, sr = librosa.load(str(drum_path), sr=None, mono=True)
     total_duration = len(audio) / sr
 
+    # FINDING-3: replace the fixed threshold with a stem-relative value so that
+    # quietly-mastered tracks are not silently truncated. The full-file audio
+    # array is passed so the peak estimate reflects the whole stem's dynamic
+    # range, not just the first vocal window.
+    effective_silence_db = _compute_dynamic_silence_db(audio, silence_db)
+    log.debug(
+        f"    🥁  Drum silence threshold: {effective_silence_db:.1f} dBFS"
+        f"{'  (user override)' if silence_db != DEFAULT_DRUM_SILENCE_DB else '  (dynamic)'}"
+    )
+
     all_segments: list[tuple[float, float]] = []
 
     for win_start, win_end in vocal_windows:
@@ -282,7 +343,7 @@ def detect_drum_segments(
 
         segments = _split_on_silence(
             times_rel, rms_db,
-            silence_db, silence_duration,
+            effective_silence_db, silence_duration,
             win_start, win_end,
         )
 
@@ -322,7 +383,6 @@ def process_file(
     output: Path,
     stems_cache: Path,
     model: str,
-    vad_silence_db: float,
     vad_silence_duration: float,
     drum_silence_db: float,
     drum_silence_duration: float,
@@ -350,7 +410,6 @@ def process_file(
             stems["vocals"],
             vad_model,
             vad_utils,
-            vad_silence_db,
             vad_silence_duration,
             device,
         )
@@ -421,13 +480,6 @@ def process_file(
     help="Directory where Demucs caches separated stems between runs.",
 )
 @click.option(
-    "--vad-silence-db",
-    default=-40.0,
-    show_default=True,
-    type=float,
-    help="dB level below which the vocal track is considered silent.",
-)
-@click.option(
     "--vad-silence-duration",
     default=6.0,
     show_default=True,
@@ -436,10 +488,14 @@ def process_file(
 )
 @click.option(
     "--drum-silence-db",
-    default=-40.0,
+    default=DEFAULT_DRUM_SILENCE_DB,
     show_default=True,
     type=float,
-    help="dB level below which the drum track is considered a cut point.",
+    help=(
+        "dB level below which the drum track is considered a cut point. "
+        "Defaults to auto (stem-relative dynamic threshold). "
+        "Pass an explicit value to override."
+    ),
 )
 @click.option(
     "--drum-silence-duration",
@@ -465,7 +521,6 @@ def main(
     input_dir: Path,
     output_dir: Path,
     stems_cache: Path,
-    vad_silence_db: float,
     vad_silence_duration: float,
     drum_silence_db: float,
     drum_silence_duration: float,
@@ -518,7 +573,6 @@ def main(
             output=output_dir,
             stems_cache=stems_cache,
             model=model,
-            vad_silence_db=vad_silence_db,
             vad_silence_duration=vad_silence_duration,
             drum_silence_db=drum_silence_db,
             drum_silence_duration=drum_silence_duration,

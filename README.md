@@ -136,7 +136,6 @@ python main.py \
   --input               /music/arabic_tracks \
   --output              /music/drum_exports \
   --stems-cache         /music/stems_cache \
-  --vad-silence-db      -40 \
   --vad-silence-duration 6.0 \
   --drum-silence-db     -40 \
   --drum-silence-duration 1.5 \
@@ -153,9 +152,8 @@ python main.py \
 | `--input`                  | *(required)*     | Folder containing source audio files |
 | `--output`                 | *(required)*     | Folder for exported drum MP3s (created if missing) |
 | `--stems-cache`            | `./stems_cache`  | Where Demucs stores separated stems between runs |
-| `--vad-silence-db`         | `-40`            | dB below which vocals are considered silent |
 | `--vad-silence-duration`   | `6.0`            | Seconds below threshold required to close a vocal window |
-| `--drum-silence-db`        | `-40`            | dB below which drums are considered a cut point |
+| `--drum-silence-db`        | `-40` *(auto)*   | dB cut point for drums. At the default, a stem-relative dynamic threshold is used instead (peak − 35 dB, floored at −60). Pass any explicit value to override. |
 | `--drum-silence-duration`  | `1.5`            | Seconds of drum silence required to split segments |
 | `--drum-min-segment`       | `1.0`            | Minimum exported segment duration (seconds) |
 | `--model`                  | `htdemucs`       | Demucs model name |
@@ -195,15 +193,19 @@ parameter choices:
 **Percussion**
 - Egyptian doumbek, tabla baladi, and riq produce sharp high-frequency
   transients. The 50 ms RMS frame window used internally resolves these
-  cleanly. The `-40 dB` drum threshold works well; lower it (e.g. `-50`)
-  only if quieter hand-percussion fills are being missed.
+  cleanly. The drum silence threshold defaults to a stem-relative dynamic
+  value (peak − 35 dB) to handle tracks at any mastering level. Lower
+  `--drum-silence-db` manually (e.g. `-50`) only if quieter hand-percussion
+  fills are still being missed after the dynamic threshold is logged.
 - If you hear a very long drum roll being split into multiple segments, increase
   `--drum-silence-duration` (e.g. `2.5`).
 
 **Demucs model**
 - `htdemucs` (default) is the recommended model for both Arabic and Western
-  material. For recordings where the drum stem bleeds into "other" heavily,
-  try `htdemucs_ft` (fine-tuned variant — slower but more precise).
+  material. `htdemucs_ft` is a fine-tuned variant that is slower but can
+  improve separation quality on some material; however, it does **not** fix
+  the Arabic percussion routing issue (doumbek / riq energy routes to the
+  `other` stem regardless of model variant).
 
 ---
 
@@ -211,7 +213,7 @@ parameter choices:
 
 Demucs is the slowest step. Separated stems are written to `--stems-cache`
 after the first run. Re-running the script on the same file reuses the cached
-WAVs instantly, so you can safely experiment with VAD / drum parameters
+WAVs instantly, so you can safely experiment with drum parameters
 without paying the Demucs cost again.
 
 To force re-separation, delete the relevant subfolder inside the cache:
