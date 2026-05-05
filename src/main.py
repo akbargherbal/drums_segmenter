@@ -113,6 +113,7 @@ def detect_vocal_windows(
     vad_utils,
     silence_duration: float,
     device: torch.device,
+    vad_threshold: float = 0.45,
 ) -> list[tuple[float, float]]:
     """
     Analyze the vocal stem and return a list of merged vocal windows:
@@ -125,6 +126,13 @@ def detect_vocal_windows(
     This makes the detector robust for Arabic music, which frequently contains
     long melismatic phrases separated by micro-pauses.
 
+    Args:
+        vad_threshold: Silero speech-probability onset threshold.
+            Default 0.45 is calibrated for htdemucs separated stems, where
+            bleed artefacts score higher than in a natural acoustic mix.
+            Lower only if melismatic tail-ends are being missed; if so,
+            prefer raising min_silence_duration_ms before reducing this value.
+
     # FINDING-1: --vad-silence-db was removed (Path A).
     # Silero VAD operates on a speech-probability score, not RMS energy.
     # There is no meaningful way to wire a dBFS threshold directly into
@@ -134,6 +142,14 @@ def detect_vocal_windows(
     # signature to avoid misleading users. If a pre-Silero energy gate is ever
     # needed, implement _apply_energy_gate() upstream of this call and expose
     # a new --vad-energy-gate flag at that time.
+
+    # FINDING-2: threshold promoted from hardcoded 0.30 to a CLI parameter.
+    # 0.30 was too permissive for Demucs-separated stems: instrument bleed
+    # (nay, oud, violin) into the vocal stem scores higher than it would in
+    # a natural acoustic mix, causing phantom vocal windows during purely
+    # instrumental sections (taqsim, lazma). Default raised to 0.45.
+    # Validation: run on tracks that contain a clearly instrumental section
+    # and confirm it produces zero or near-zero windows there.
     """
     get_speech_timestamps, _, _, _, _ = vad_utils
 
@@ -146,10 +162,10 @@ def detect_vocal_windows(
         audio_tensor,
         vad_model,
         sampling_rate=16_000,
-        threshold=0.30,           # slightly permissive for ornamental vocals
+        threshold=vad_threshold,          # FINDING-2: was hardcoded 0.30
         min_speech_duration_ms=150,
         min_silence_duration_ms=200,
-        return_seconds=False,     # returns sample indices
+        return_seconds=False,             # returns sample indices
     )
 
     if not raw_timestamps:
@@ -244,12 +260,30 @@ def _split_on_silence(
     silence_duration: float,
     win_start: float,
     win_end: float,
+    tail_pad: float = 0.4,
 ) -> list[tuple[float, float]]:
     """
     Walk a frame-level dB trace and split it into contiguous active segments.
 
     A split is only made when the signal stays below *silence_db* for at least
     *silence_duration* seconds — mirroring Audacity's "silence finder" logic.
+
+    Args:
+        tail_pad: seconds to extend each segment past the silence_onset point
+            when a mid-window split is confirmed. Preserves the natural
+            resonance decay of Arabic hand percussion (doumbek, riq) that
+            falls below the threshold before it fully rings out.
+
+            # FINDING-4: the original code closed segments exactly at
+            # silence_onset — the first frame that crossed below the threshold.
+            # This clipped the audible resonance tail of doumbek hits. Fix:
+            # extend the segment end by tail_pad seconds past silence_onset,
+            # clamped to win_end to prevent overrun into the next window.
+            #
+            # The pad is applied ONLY to mid-window silence-confirmed closures
+            # (where t - silence_onset >= silence_duration triggers the split).
+            # The final segment in each window is closed at win_end and already
+            # captures the full tail by definition — no pad is applied there.
 
     Returns list of (seg_start_abs, seg_end_abs) in absolute track time.
     """
@@ -272,15 +306,20 @@ def _split_on_silence(
                 if silence_onset is None:
                     silence_onset = t
                 elif t - silence_onset >= silence_duration:
-                    # Silence confirmed long enough → close segment at onset
-                    segments.append((seg_start, silence_onset))
+                    # Silence confirmed long enough → close segment.
+                    # FINDING-4: extend past silence_onset by tail_pad to
+                    # capture percussion resonance decay, clamped to win_end.
+                    seg_end = min(silence_onset + tail_pad, win_end)
+                    segments.append((seg_start, seg_end))
                     seg_start = None
                     silence_onset = None
             else:
                 # Back above threshold → reset silence counter
                 silence_onset = None
 
-    # Close any still-open segment at the vocal window boundary
+    # Close any still-open segment at the vocal window boundary.
+    # No tail pad here: the segment already runs to win_end (or silence_onset
+    # if a streak was in progress), which includes the full natural tail.
     if seg_start is not None:
         close_at = silence_onset if silence_onset is not None else win_end
         segments.append((seg_start, close_at))
@@ -298,6 +337,7 @@ def detect_drum_segments(
     silence_db: float,
     silence_duration: float,
     min_segment: float,
+    tail_pad: float,
 ) -> list[tuple[float, float]]:
     """
     For each vocal window, slice the drum stem and detect continuous bursts.
@@ -345,6 +385,7 @@ def detect_drum_segments(
             times_rel, rms_db,
             effective_silence_db, silence_duration,
             win_start, win_end,
+            tail_pad,
         )
 
         for seg_start, seg_end in segments:
@@ -384,9 +425,11 @@ def process_file(
     stems_cache: Path,
     model: str,
     vad_silence_duration: float,
+    vad_threshold: float,
     drum_silence_db: float,
     drum_silence_duration: float,
     drum_min_segment: float,
+    drum_tail_pad: float,
     file_index: int,
     total_files: int,
     device: torch.device,
@@ -412,6 +455,7 @@ def process_file(
             vad_utils,
             vad_silence_duration,
             device,
+            vad_threshold,
         )
 
         # ── Step 3: Instrumental-only check ─────────────────────────────────
@@ -430,6 +474,7 @@ def process_file(
             drum_silence_db,
             drum_silence_duration,
             drum_min_segment,
+            drum_tail_pad,
         )
 
         log.info(f"    🥁  Detecting drum segments within vocal zones... {len(segments)} segment(s) found")
@@ -487,6 +532,18 @@ def process_file(
     help="Seconds of continuous silence required to close a vocal window.",
 )
 @click.option(
+    "--vad-threshold",
+    default=0.45,
+    show_default=True,
+    type=float,
+    help=(
+        "Silero VAD speech-probability threshold. "
+        "Higher values are stricter (fewer, more confident windows). "
+        "Default 0.45 is calibrated for htdemucs stems; lower only if "
+        "melismatic tail-ends are being missed."
+    ),
+)
+@click.option(
     "--drum-silence-db",
     default=DEFAULT_DRUM_SILENCE_DB,
     show_default=True,
@@ -512,6 +569,18 @@ def process_file(
     help="Minimum exported segment duration in seconds; shorter ones are discarded.",
 )
 @click.option(
+    "--drum-tail-pad",
+    default=0.4,
+    show_default=True,
+    type=float,
+    help=(
+        "Seconds of resonance tail to include after a drum segment's silence "
+        "onset. Prevents doumbek/riq decay from being clipped at the threshold "
+        "crossing point. Applied only to mid-window splits, not the final "
+        "segment in each vocal window."
+    ),
+)
+@click.option(
     "--model",
     default="htdemucs",
     show_default=True,
@@ -522,9 +591,11 @@ def main(
     output_dir: Path,
     stems_cache: Path,
     vad_silence_duration: float,
+    vad_threshold: float,
     drum_silence_db: float,
     drum_silence_duration: float,
     drum_min_segment: float,
+    drum_tail_pad: float,
     model: str,
 ) -> None:
     """Automated Drum Stem Extraction Based on Vocal Activity.
@@ -574,9 +645,11 @@ def main(
             stems_cache=stems_cache,
             model=model,
             vad_silence_duration=vad_silence_duration,
+            vad_threshold=vad_threshold,
             drum_silence_db=drum_silence_db,
             drum_silence_duration=drum_silence_duration,
             drum_min_segment=drum_min_segment,
+            drum_tail_pad=drum_tail_pad,
             file_index=idx,
             total_files=n,
             device=device,

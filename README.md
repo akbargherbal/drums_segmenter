@@ -133,30 +133,34 @@ python main.py \
 ### Full example with custom parameters
 ```bash
 python main.py \
-  --input               /music/arabic_tracks \
-  --output              /music/drum_exports \
-  --stems-cache         /music/stems_cache \
+  --input                /music/arabic_tracks \
+  --output               /music/drum_exports \
+  --stems-cache          /music/stems_cache \
   --vad-silence-duration 6.0 \
-  --drum-silence-db     -40 \
+  --vad-threshold        0.45 \
+  --drum-silence-db      -40 \
   --drum-silence-duration 1.5 \
-  --drum-min-segment    1.0 \
-  --model               htdemucs
+  --drum-min-segment     1.0 \
+  --drum-tail-pad        0.4 \
+  --model                htdemucs
 ```
 
 ---
 
 ## CLI Reference
 
-| Argument                   | Default          | Description |
-|----------------------------|------------------|-------------|
-| `--input`                  | *(required)*     | Folder containing source audio files |
-| `--output`                 | *(required)*     | Folder for exported drum MP3s (created if missing) |
-| `--stems-cache`            | `./stems_cache`  | Where Demucs stores separated stems between runs |
-| `--vad-silence-duration`   | `6.0`            | Seconds below threshold required to close a vocal window |
-| `--drum-silence-db`        | `-40` *(auto)*   | dB cut point for drums. At the default, a stem-relative dynamic threshold is used instead (peak − 35 dB, floored at −60). Pass any explicit value to override. |
-| `--drum-silence-duration`  | `1.5`            | Seconds of drum silence required to split segments |
-| `--drum-min-segment`       | `1.0`            | Minimum exported segment duration (seconds) |
-| `--model`                  | `htdemucs`       | Demucs model name |
+| Argument                    | Default          | Description |
+|-----------------------------|------------------|-------------|
+| `--input`                   | *(required)*     | Folder containing source audio files |
+| `--output`                  | *(required)*     | Folder for exported drum MP3s (created if missing) |
+| `--stems-cache`             | `./stems_cache`  | Where Demucs stores separated stems between runs |
+| `--vad-silence-duration`    | `6.0`            | Seconds of continuous silence required to close a vocal window |
+| `--vad-threshold`           | `0.45`           | Silero VAD speech-probability threshold. Higher = stricter. Calibrated for htdemucs stems; lower only if melismatic tail-ends are missed |
+| `--drum-silence-db`         | `-40` *(auto)*   | dB cut point for drums. At the default, a stem-relative dynamic threshold is used (peak − 35 dB, floored at −60). Pass any explicit value to override |
+| `--drum-silence-duration`   | `1.5`            | Seconds of drum silence required to split segments |
+| `--drum-min-segment`        | `1.0`            | Minimum exported segment duration (seconds) |
+| `--drum-tail-pad`           | `0.4`            | Seconds of resonance tail to preserve after a segment's silence onset. Prevents doumbek/riq decay from being clipped. Applied to mid-window splits only |
+| `--model`                   | `htdemucs`       | Demucs model name |
 
 ---
 
@@ -187,8 +191,12 @@ parameter choices:
 - Melismatic (maqam) phrasing produces dense ornamental runs that Silero VAD
   may parse as many short bursts. The 6-second merge window (`--vad-silence-duration`)
   keeps entire sung phrases as a single vocal zone.
+- The VAD threshold (`--vad-threshold`, default `0.45`) is calibrated for
+  Demucs-separated stems. If melismatic tail-ends are being missed, lower this
+  value cautiously (try `0.40`); do not go below `0.35` without also raising
+  `--vad-silence-duration` to compensate for increased false positives.
 - If your recordings have longer instrumental interludes between vocal passages,
-  reduce this value (e.g. `--vad-silence-duration 3.0`) to split them.
+  reduce `--vad-silence-duration` (e.g. `3.0`) to split them.
 
 **Percussion**
 - Egyptian doumbek, tabla baladi, and riq produce sharp high-frequency
@@ -197,6 +205,9 @@ parameter choices:
   value (peak − 35 dB) to handle tracks at any mastering level. Lower
   `--drum-silence-db` manually (e.g. `-50`) only if quieter hand-percussion
   fills are still being missed after the dynamic threshold is logged.
+- The `--drum-tail-pad` (default `0.4 s`) preserves the natural ring-out of
+  doumbek and riq strokes that decay below the silence threshold before they
+  fully resolve. Increase to `0.6` if decay tails are still being clipped.
 - If you hear a very long drum roll being split into multiple segments, increase
   `--drum-silence-duration` (e.g. `2.5`).
 
@@ -213,7 +224,7 @@ parameter choices:
 
 Demucs is the slowest step. Separated stems are written to `--stems-cache`
 after the first run. Re-running the script on the same file reuses the cached
-WAVs instantly, so you can safely experiment with drum parameters
+WAVs instantly, so you can safely experiment with VAD and drum parameters
 without paying the Demucs cost again.
 
 To force re-separation, delete the relevant subfolder inside the cache:
@@ -261,6 +272,9 @@ rm -rf ./stems_cache/Fadhel_Shaker_Ya_Ghayeb/
 | `No module named 'demucs'` | Run `pip install -r requirements.txt` |
 | `ffmpeg not found` | Install ffmpeg and ensure it is on your `PATH` |
 | Vocal windows too short (Arabic ornaments cut off) | Increase `--vad-silence-duration` (try `8.0`) |
+| Phantom vocal windows in instrumental sections | Increase `--vad-threshold` (try `0.50`) |
+| True vocal windows being missed | Decrease `--vad-threshold` (try `0.40`) |
+| Doumbek/riq tails clipped at segment end | Increase `--drum-tail-pad` (try `0.6`) |
 | Too many tiny drum segments | Increase `--drum-min-segment` (try `2.0`) |
 | Drum segments not splitting at breaks | Decrease `--drum-silence-duration` (try `1.0`) |
 | CUDA out of memory | Use `--model htdemucs` (default) instead of larger variants |
