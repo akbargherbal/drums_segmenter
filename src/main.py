@@ -88,17 +88,33 @@ def separate_stems(
 
     stem_dir.mkdir(parents=True, exist_ok=True)
 
-    # Import here so the rest of the script is importable without demucs
-    from demucs.api import Separator
+    # Use the demucs CLI via subprocess rather than demucs.api.
+    # demucs.api was added in 4.0.0 but is absent in many Colab builds even
+    # after `pip install -U demucs`; the CLI entry point always works.
+    # sys.executable guarantees we run demucs under the same Python that is
+    # executing this script, so the package lookup path is identical.
+    import shutil
+    import subprocess
+    import tempfile
 
-    separator = Separator(model=model_name, device=str(device))
-    _, separated = separator.separate_audio_file(audio_path)
+    device_str = str(device).split(":")[0]  # "cuda", "mps", or "cpu"
 
-    for stem_name, tensor in separated.items():
-        if stem_name not in expected:
-            continue
-        out_path = expected[stem_name]
-        separator.save_audio(tensor, out_path, samplerate=separator.samplerate)
+    with tempfile.TemporaryDirectory() as tmp_out:
+        cmd = [
+            sys.executable, "-m", "demucs",
+            "-n", model_name,
+            "-d", device_str,
+            "--out", tmp_out,
+            str(audio_path),
+        ]
+        subprocess.run(cmd, check=True)
+
+        # Demucs CLI writes: {tmp_out}/{model_name}/{track_stem}/{stem}.wav
+        demucs_track_dir = Path(tmp_out) / model_name / audio_path.stem
+        for stem_name, dest_path in expected.items():
+            src = demucs_track_dir / f"{stem_name}.wav"
+            if src.exists():
+                shutil.copy2(src, dest_path)
 
     return expected
 
