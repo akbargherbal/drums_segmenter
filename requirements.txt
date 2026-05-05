@@ -1,0 +1,33 @@
+# ══════════════════════════════════════════════════════════════════════════════
+#  requirements.txt — Automated Drum Stem Extractor
+# ══════════════════════════════════════════════════════════════════════════════
+#
+#  PyTorch is NOT listed here because the correct wheel depends on your
+#  hardware.  Install it FIRST using the instructions in README.md before
+#  running `pip install -r requirements.txt`.
+#
+#  Tested on Python 3.10 / 3.11.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Stem separation ───────────────────────────────────────────────────────────
+demucs==4.0.1
+
+# ── Audio I/O & analysis ──────────────────────────────────────────────────────
+librosa==0.10.2
+soundfile==0.12.1
+pydub==0.25.1           # MP3 export via ffmpeg
+audioread==3.0.1        # fallback decoder used by librosa
+
+# ── Silero VAD (downloaded at runtime via torch.hub) ─────────────────────────
+# No pip package needed — torch.hub.load('snakers4/silero-vad', ...) handles it.
+# Listed here for documentation purposes only:
+#   snakers4/silero-vad  (GitHub, latest)
+
+# ── Numerics ─────────────────────────────────────────────────────────────────
+numpy==1.26.4
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+click==8.1.7
+
+# ── Utilities ────────────────────────────────────────────────────────────────
+tqdm==4.66.4            # progress bars (used internally by Demucs)
